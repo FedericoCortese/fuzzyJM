@@ -36,5 +36,5 @@ sim_data <- simulate_fuzzy_mixture_mv(TT = 300, P = 3, K = 2)
 
 # Fit fuzzy jump model
 res <- fuzzy_jump_cpp(sim_data[, paste0("Y", 1:3)], 
-                      K = 2, lambda = 1e-4, m = 1.5, 
-                      max_iter = 10, n_init = 5, parallel = TRUE)
+                      K = 2, lambda = .25, m = 1.25, 
+                      max_iter = 10, n_init = 5, parallel = F)
