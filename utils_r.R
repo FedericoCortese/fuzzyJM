@@ -7,154 +7,266 @@ fuzzy_jump_cpp <- function(Y,
                            tol = 1e-16, 
                            verbose = FALSE,
                            parallel = FALSE,
-                           n_cores = NULL
-) {
-  # Fit jump model for mixed‐type data 
+                           n_cores = NULL,
+                           pen_exp = 2,
+                           s_init = NULL) {
+  # Fit fuzzy jump model for mixed‐type time series with Gower dissimilarity and L^{pen_exp} jump penalty
   #
   # Arguments:
-  #   Y            - data.frame with mixed data types (categorical vars must be factors)
-  #   K            - number of states
-  #   lambda       - penalty for the number of jumps
-  #   m            - fuzziness exponent (for soft membership)
-  #   max_iter     - maximum number of iterations per initialization
-  #   n_init       - number of random initializations
-  #   tol          - convergence tolerance
-  #   verbose      - print progress per iteration (TRUE/FALSE)
-  #   parallel     - if TRUE, use mclapply for parallel initializations
-  #   n_cores      - number of cores for mclapply; if NULL, uses detectCores() - 1
+  #   Y        - data.frame or matrix with mixed data types (categorical variables as factor/character)
+  #   K        - number of states
+  #   lambda   - jump penalty hyperparameter
+  #   m        - fuzziness exponent for soft memberships
+  #   max_iter - maximum number of iterations per initialization
+  #   n_init   - number of initializations
+  #   tol      - convergence tolerance (set NULL to disable)
+  #   verbose  - logical; print progress and diagnostics
+  #   parallel - logical; use mclapply for multiple initializations
+  #   n_cores  - number of cores when parallel = TRUE; if NULL uses detectCores() - 1
+  #   pen_exp  - exponent of the L^{pen_exp} penalty on the temporal total variation of S
+  #   s_init   - optional vector of initial hard states of length TT
   #
   # Value:
-  #   List with:
-  #     best_S      - TT×K soft‐membership matrix from best initialization
-  #     best_mu     - K×P state‐conditional weighted medians/modes(computed on scaled data)
-  #     loss        - best objective value
-  #     MAP         - re‐ordered state sequence (1..K)
-  #     feature_types - vector indicating feature types (0 for continuous, 1 for categorical)
+  #   A list with components:
+  #     best_S        - TT × K soft‐membership matrix from best initialization
+  #     best_mu       - K × P state‐conditional prototypes (weighted medians/modes on scaled data)
+  #     loss          - best objective value
+  #     MAP           - re‐ordered state sequence (1..K)
+  #     Y             - processed data matrix used in fitting
+  #     feature_types - integer vector (0 = continuous, 1 = categorical)
+  #     all_losses    - objective values along the iterations of the selected run
   
-  K <- as.integer(K)
+  lambda <- lambda / (2 ^ pen_exp)
+  Rcpp::sourceCpp("utils_c.cpp")
+  
+  K  <- as.integer(K)
   TT <- nrow(Y)
   P  <- ncol(Y)
   
-  Rcpp::sourceCpp("utils_c.cpp")
-  
-  # Get feature types vector
   feature_types <- sapply(Y, class)
-  # Convert feature_types to integer (0 for continuous, 1 for categorical)
   feature_types <- as.integer(feature_types == "factor" | feature_types == "character")
   
-  # Standardize only continuous features
   for (j in seq_len(P)) {
-    if (feature_types[j] == 0) {  # Continuous feature
+    if (feature_types[j] == 0) {
       Y[[j]] <- scale(Y[[j]], center = TRUE, scale = TRUE)
-    } 
+    }
   }
   
-  # Transform into a matrix
-  if(!is.matrix(Y)){
-    Y=as.matrix(
+  if (!is.matrix(Y)) {
+    Y <- as.matrix(
       data.frame(
         lapply(Y, function(col) {
-          if (is.factor(col)||is.character(col)) as.integer(as.character(col))
-          else              as.numeric(col)
+          if (is.factor(col) || is.character(col)) as.integer(as.character(col))
+          else                                     as.numeric(col)
         })
       )
     )
   }
   
-  
   run_one <- function(init) {
-    # Single initialization
-    # 1) Initialize hard states via k‐prototypes++ 
-    s <- initialize_states(Y, K)
-    S <- matrix(0, nrow = TT, ncol = K)
-    S[cbind(seq_len(TT), s)] <- 1L
+    all_losses <- NULL
+    all_tv     <- NULL
     
-    # 2) Initialize mu: state‐conditional medians/modes
-    mu <- matrix(NA_real_, nrow = K, ncol = P, 
-                 dimnames = list(NULL, colnames(Y)))
+    if (sum(feature_types) == 0) {
+      temp <- cont_jump(
+        Y           = as.matrix(Y),
+        K           = K,
+        jump_penalty= lambda,
+        alpha       = pen_exp,
+        mode_loss   = FALSE,
+        n_init      = 5,
+        grid_size   = 0.1
+      )
+      S <- temp$best_S
+    } else {
+      if (!is.null(s_init)) {
+        s <- s_init
+      } else {
+        s <- initialize_states(Y, K)
+      }
+      S <- matrix(0, nrow = TT, ncol = K)
+      S[cbind(seq_len(TT), s)] <- 1L
+    }
+    
+    mu <- matrix(NA_real_, nrow = K, ncol = P, dimnames = list(NULL, colnames(Y)))
+    
+    global_median <- numeric(P)
+    global_mode   <- numeric(P)
+    
+    for (p in seq_len(P)) {
+      x <- Y[, p]
+      if (feature_types[p] == 0L) {
+        global_median[p] <- stats::median(x, na.rm = TRUE)
+        global_mode[p]   <- NA_real_
+      } else {
+        tab_x <- table(x)
+        if (length(tab_x) == 0L) {
+          global_mode[p] <- NA_real_
+        } else {
+          global_mode[p] <- as.numeric(names(which.max(tab_x)))
+        }
+        global_median[p] <- NA_real_
+      }
+    }
     
     for (k in seq_len(K)) {
       w <- S[, k]^m
+      w[is.na(w)] <- 0
+      sw <- sum(w)
+      
       for (p in seq_len(P)) {
+        x <- Y[, p]
+        
         if (feature_types[p] == 0L) {
-          mu[k, p] <- as.numeric(poliscidata::wtd.median(Y[, p], weights = w))
+          if (is.na(sw) || sw < 1e-12 || all(is.na(x))) {
+            mu[k, p] <- global_median[p]
+          } else {
+            mu[k, p] <- as.numeric(
+              suppressWarnings(poliscidata::wtd.median(x, weights = w))
+            )
+          }
         } else {
-          mu[k, p] <- as.numeric(poliscidata::wtd.mode(Y[, p], weights = w))
+          if (is.na(sw) || sw < 1e-12 || all(is.na(x))) {
+            mu[k, p] <- global_mode[p]
+          } else {
+            mu[k, p] <- as.numeric(
+              suppressWarnings(poliscidata::wtd.mode(x, weights = w))
+            )
+          }
         }
       }
     }
     
     S_old <- S
-    V <- gower_dist(Y, mu)
-    loss_old <- sum(V * (S^m)) + lambda * sum(abs(S[1:(TT-1), ] - S[2:TT, ])^2)
+    V <- gower_dist(Y, mu, feat_type = feature_types)
+    
+    if (TT > 1) {
+      dS <- S[2:TT, , drop = FALSE] - S[1:(TT - 1), , drop = FALSE]
+      tv_old <- sum(rowSums(abs(dS))^pen_exp)
+    } else {
+      tv_old <- 0
+    }
+    loss_old <- sum(V * (S^m)) + lambda * tv_old
+    all_losses <- c(all_losses, loss_old)
+    all_tv     <- c(all_tv, tv_old)
     
     for (it in seq_len(max_iter)) {
+      if (TT > 1) {
+        S[1, ] <- optimize_pgd_1T(
+          init    = S[1, ],
+          g       = V[1, ],
+          s_t1    = S[2, ],
+          lambda  = lambda,
+          m       = m,
+          pen_exp = pen_exp
+        )$par
+      } else {
+        S[1, ] <- optimize_pgd_1T(
+          init    = S[1, ],
+          g       = V[1, ],
+          s_t1    = S[1, ],
+          lambda  = 0,
+          m       = m,
+          pen_exp = pen_exp
+        )$par
+      }
       
-      # Update S[1, ]
-      S[1, ] <- optimize_pgd_1T(
-        init   = rep(1/K, K),
-        g      = V[1, ],
-        s_t1   = S[2, ],
-        lambda = lambda,
-        m      = m
-      )$par
-      
-      # Update S[2:(TT-1), ]
       if (TT > 2) {
         for (t in 2:(TT - 1)) {
           S[t, ] <- optimize_pgd_2T(
-            init    = rep(1/K, K),
+            init    = S[t, ],
             g       = V[t, ],
             s_prec  = S[t - 1, ],
             s_succ  = S[t + 1, ],
             lambda  = lambda,
-            m       = m
+            m       = m,
+            pen_exp = pen_exp
           )$par
         }
       }
       
-      # Update S[TT, ]
-      S[TT, ] <- optimize_pgd_1T(
-        init   = rep(1/K, K),
-        g      = V[TT, ],
-        s_t1   = S[TT - 1, ],
-        lambda = lambda,
-        m      = m
-      )$par
+      if (TT > 1) {
+        S[TT, ] <- optimize_pgd_1T(
+          init    = S[TT, ],
+          g       = V[TT, ],
+          s_t1    = S[TT - 1, ],
+          lambda  = lambda,
+          m       = m,
+          pen_exp = pen_exp
+        )$par
+      }
       
-      # Recompute mu
+      S <- S / rowSums(S)
+      
       for (k in seq_len(K)) {
         w <- S[, k]^m
+        w[is.na(w)] <- 0
+        
         for (p in seq_len(P)) {
+          x <- Y[, p]
+          
           if (feature_types[p] == 0L) {
-            mu[k, p] <- as.numeric(poliscidata::wtd.median(Y[, p], weights = w))
+            if (sum(w) < 1e-12 || all(is.na(x))) {
+              mu[k, p] <- stats::median(x, na.rm = TRUE)
+            } else {
+              mu[k, p] <- as.numeric(
+                suppressWarnings(poliscidata::wtd.median(x, weights = w))
+              )
+            }
           } else {
-            mu[k, p] <- as.numeric(poliscidata::wtd.mode(Y[, p], weights = w))
+            if (sum(w) < 1e-12 || all(is.na(x))) {
+              tab_x <- table(x)
+              if (length(tab_x) == 0L) {
+                mu[k, p] <- NA_real_
+              } else {
+                mu[k, p] <- as.numeric(names(which.max(tab_x)))
+              }
+            } else {
+              mu[k, p] <- as.numeric(
+                suppressWarnings(poliscidata::wtd.mode(x, weights = w))
+              )
+            }
           }
         }
       }
       
-      # Recompute distances and loss
-      
-      V <- gower_dist(Y, mu)
-      loss <- sum(V * (S^m)) + lambda * sum(abs(S[1:(TT-1), ] - S[2:TT, ])^2)
-      
-      if (verbose) cat(sprintf("Initialization %d, Iteration %d: loss = %.6e\n", init, it, loss))
-      
-      # Check convergence
-      if (!is.null(tol)) {
-        if ((loss_old - loss) < tol) break
-      } else if (all(S == S_old)) {
-        break
+      V  <- gower_dist(Y, mu, feat_type = feature_types)
+      if (TT > 1) {
+        dS <- S[2:TT, , drop = FALSE] - S[1:(TT - 1), , drop = FALSE]
+        tv <- sum(rowSums(abs(dS))^pen_exp)
+      } else {
+        tv <- 0
       }
+      loss <- sum(V * (S^m)) + lambda * tv
+      
+      all_losses <- c(all_losses, loss)
+      all_tv     <- c(all_tv, tv)
+      if (verbose)
+        cat(sprintf("Init %d, Iter %d: loss = %.6e, TV = %.6e\n",
+                    init, it, loss, tv))
+      
+      improv <- loss_old - loss
+      if (!is.null(tol)) {
+        if (improv >= 0 && improv < tol) break
+        if (sum(abs(S - S_old)^pen_exp) < tol) {
+          break
+        }
+      }
+      
       loss_old <- loss
-      S_old <- S
+      tv_old   <- tv
+      S_old    <- S
     }
     
-    list(S = S, loss = loss_old, mu = mu)
+    list(
+      S          = S,
+      mu         = mu,
+      loss       = loss_old,
+      all_losses = all_losses,
+      all_tv     = all_tv
+    )
   }
   
-  # Choose apply function based on parallel flag
   if (parallel) {
     library(parallel)
     if (is.null(n_cores)) {
@@ -165,30 +277,64 @@ fuzzy_jump_cpp <- function(Y,
     res_list <- lapply(seq_len(n_init), run_one)
   }
   
-  # Find best initialization
-  losses <- vapply(res_list, function(x) x$loss, numeric(1))
+  losses   <- vapply(res_list, function(x) x$loss, numeric(1))
   best_idx <- which.min(losses)
   best_run <- res_list[[best_idx]]
   best_S   <- best_run$S
   best_loss<- best_run$loss
   best_mu  <- best_run$mu
+  all_losses <- best_run$all_losses
   
-  # Compute MAP and re‐order states
+  V_best <- gower_dist(Y, best_mu, feat_type = feature_types)
+  
+  if (TT > 1) {
+    dS <- best_S[2:TT, , drop = FALSE] - best_S[1:(TT - 1), , drop = FALSE]
+    tv_best <- sum(rowSums(abs(dS))^pen_exp)
+  } else {
+    tv_best <- 0
+  }
+  loss_best_check <- sum(V_best * (best_S^m)) + lambda * tv_best
+  
+  Gk      <- colSums(V_best)
+  k_star  <- which.min(Gk)
+  S_const <- matrix(0, nrow = TT, ncol = K)
+  S_const[, k_star] <- 1
+  
+  if (TT > 1) {
+    dS <- S_const[2:TT, , drop = FALSE] - S_const[1:(TT - 1), , drop = FALSE]
+    tv_const <- sum(rowSums(abs(dS))^pen_exp)
+  } else {
+    tv_const <- 0
+  }
+  loss_const <- sum(V_best * S_const) + lambda * tv_const
+  
+  if (verbose) {
+    cat("---- CHECK percorso costante ----\n")
+    cat(sprintf("  best_idx      = %d\n", best_idx))
+    cat(sprintf("  loss_best     = %.6e (stored)\n", best_loss))
+  }
+  
   old_MAP <- apply(best_S, 1, which.max)
   MAP <- order_states_condMed(Y[, 1], old_MAP)
   tab <- table(MAP, old_MAP)
   new_order <- apply(tab, 1, which.max)
-  best_S <- best_S[, new_order]
+  best_S  <- best_S[, new_order, drop = FALSE]
+  best_mu <- best_mu[new_order, , drop = FALSE]
   
+  best_S <- best_S / rowSums(best_S)
   
   return(list(
-    best_S    = best_S,
-    best_mu = best_mu,
-    loss      = best_loss,
-    MAP       = MAP,
-    feature_types = feature_types
+    best_S        = best_S,
+    best_mu       = best_mu,
+    loss          = best_loss,
+    MAP           = MAP,
+    Y             = Y,
+    feature_types = feature_types,
+    all_losses    = all_losses
   ))
 }
+
+
 
 order_states_condMed=function(y,s){
   

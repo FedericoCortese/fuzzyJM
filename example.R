@@ -30,14 +30,14 @@ str(Y)
 
 m=1.25
 K=3
-lambda=.5
+lambda=1
 fit=fuzzy_jump_cpp(Y=Y,
                    K=K,
                    m=m,
                    lambda=lambda,
                    n_init=5,
-                   max_iter=10,
-                   tol=1e-8,
+                   max_iter=100,
+                   tol=1e-4,
                    verbose=T)
 
 # Analyze results
